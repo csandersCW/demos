@@ -4,11 +4,21 @@ import os
 import sys
 import uuid
 from typing import Optional
+from urllib.parse import urlsplit
 
 from dotenv import load_dotenv
 from openai import OpenAI
 
 load_dotenv()  # picks up any endpoint credentials from a local .env file, if present
+
+if __package__:
+    from .observability import (
+        observe_episode, call_model, call_tool, configure_agent_lens, shutdown_agent_lens,
+    )
+else:
+    from observability import (
+        observe_episode, call_model, call_tool, configure_agent_lens, shutdown_agent_lens,
+    )
 
 try:
     # Package-relative import: works when this file lives inside a package,
@@ -192,6 +202,21 @@ def _guess_category(text: str) -> str:
     return "slow_performance"
 
 
+def _execute_tool(tools, name, raw_args):
+    try:
+        args = json.loads(raw_args)
+    except json.JSONDecodeError:
+        args = {}
+    method = getattr(tools, name, None)
+    if method is None:
+        return {"error": f"unknown tool {name}"}, args
+    try:
+        return method(**args), args
+    except Exception as e:
+        return {"error": f"invalid arguments for {name}: {e}"}, args
+
+
+@observe_episode
 def run_episode(ticket, world, chat_fn, max_turns=8,
                  agent_name="helpdesk-triage-agent", model_name="unknown", provider_name="unknown",
                  prior_messages=None, prior_tool_calls=None, follow_up_message=None):
@@ -227,7 +252,7 @@ def run_episode(ticket, world, chat_fn, max_turns=8,
     tools_schema = _tools_schema_for_category(ticket.category)
 
     for _ in range(max_turns):
-        response = chat_fn(messages, tools_schema)
+        response = call_model(chat_fn, messages, tools_schema)
         messages.append({
             "role": "assistant",
             "content": response.get("content"),
@@ -245,23 +270,18 @@ def run_episode(ticket, world, chat_fn, max_turns=8,
         for tc in tool_calls:
             name = tc["function"]["name"]
             raw_args = tc["function"].get("arguments") or "{}"
-            try:
-                args = json.loads(raw_args)
-            except json.JSONDecodeError:
-                args = {}
-            method = getattr(tools, name, None)
-            if method is None:
-                result = {"error": f"unknown tool {name}"}
-            else:
-                try:
-                    result = method(**args)
-                except Exception as e:
-                    # The model called this tool with missing/malformed
-                    # arguments (e.g. resolve_ticket without kb_article_id).
-                    # Feed the error back as a tool result so the model can
-                    # retry next turn, rather than crashing the whole episode
-                    # (and, with it, the whole eval run) over one bad call.
-                    result = {"error": f"invalid arguments for {name}: {e}"}
+            # Observe only actual dispatch, never replayed history. Preserve
+            # the existing recoverable-error contract so the model can retry.
+            dispatched = {}
+
+            def dispatch():
+                result, args = _execute_tool(tools, name, raw_args)
+                dispatched["args"] = args
+                return result
+
+            result = call_tool(dispatch, name=name, arguments=raw_args,
+                               tool_call_id=tc.get("id", name))
+            args = dispatched["args"]
 
             messages.append({
                 "role": "tool", "tool_call_id": tc.get("id", name),
@@ -309,6 +329,7 @@ def run_episode(ticket, world, chat_fn, max_turns=8,
         "messages": messages,
         "turns": len(messages),
         "turn_trace_id": None,
+        "response_text": final_response_text,
         "status": "pending" if pending_question is not None else "done",
         "pending_question": pending_question,
     }
@@ -328,6 +349,10 @@ class HelpdeskAgentModel:
         self.base_url = base_url
         self.api_key = api_key
         self.max_turns = max_turns
+        self.provider_name = {
+            "api.openai.com": "openai",
+            "api.inference.wandb.ai": "wandb",
+        }.get(urlsplit(base_url).hostname, "openai-compatible")
 
     def predict(self, ticket_id: str, account_id: str, category: str, text: str,
                 account_tier: str, account_device_os: str,
@@ -347,7 +372,15 @@ class HelpdeskAgentModel:
                      "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
                     for tc in msg.tool_calls
                 ]
-            return {"content": msg.content, "tool_calls": tool_calls}
+            return {
+                "content": msg.content, "tool_calls": tool_calls,
+                "_telemetry": {
+                    "response_id": resp.id, "response_model": resp.model,
+                    "finish_reasons": [resp.choices[0].finish_reason]
+                    if resp.choices[0].finish_reason is not None else [],
+                    "usage": resp.usage.model_dump(exclude_none=True) if resp.usage else None,
+                },
+            }
 
         world, ticket = world_and_ticket_from_row({
             "ticket_id": ticket_id, "account_id": account_id, "category": category, "text": text,
@@ -357,7 +390,7 @@ class HelpdeskAgentModel:
         })
         ep = run_episode(
             ticket, world, chat_fn, max_turns=self.max_turns,
-            agent_name="helpdesk-triage-agent", model_name=self.model_name, provider_name="wandb-serverless",
+            agent_name="helpdesk-triage-agent", model_name=self.model_name, provider_name=self.provider_name,
             prior_messages=prior_messages, prior_tool_calls=prior_tool_calls, follow_up_message=follow_up_message,
         )
         return {
@@ -735,9 +768,8 @@ def ask_agent(question, *, ticket_id=None, category=None,
     create_escalation) has been taken, or "pending" if the agent is instead
     waiting on a reply to request_more_info - in which case "pending_question"
     holds that question and "resume" holds everything a follow-up ask_agent()
-    call needs (see the `resume` parameter above). "turn_trace_id" is always
-    None in this de-instrumented module (kept only for shape-compatibility
-    with callers written against agent.py's contract).
+    call needs (see the `resume` parameter above). "turn_trace_id" is the
+    current Agent Lens turn's OTel trace ID when tracing is enabled, else None.
 
     Raises ValueError if client="remote" and no api_key/model is available.
     """
@@ -845,6 +877,10 @@ def main():
     parser.add_argument("--model", default=None, help="Model name (required for --client remote)")
     parser.add_argument("--base-url", default=DEFAULT_BASE_URL)
     parser.add_argument("--score", action="store_true", help="Also grade the response against ground truth")
+    parser.add_argument("--agent-lens-project", default=os.environ.get("HELPDESK_AGENT_LENS_PROJECT"),
+                        help="Enable Agent Lens for an explicit entity/project")
+    parser.add_argument("--capture-content", action="store_true",
+                        help="Opt in to capturing ticket, model, and tool payloads")
     args = parser.parse_args()
 
     if args.client == "remote" and not args.model:
@@ -853,6 +889,9 @@ def main():
     api_key = os.environ.get("WANDB_API_KEY")
     if args.client == "remote" and not api_key:
         sys.exit("Set WANDB_API_KEY in .env (or export it) to use --client remote")
+
+    if args.agent_lens_project:
+        configure_agent_lens(args.agent_lens_project, include_content=args.capture_content)
 
     ticket_id = f"CLI-{uuid.uuid4().hex[:8]}"
     result = ask_agent(
@@ -900,4 +939,7 @@ def _print_ask_agent_result(result, args):
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    finally:
+        shutdown_agent_lens()

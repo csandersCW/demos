@@ -8,6 +8,11 @@ from typing import Optional
 from dotenv import load_dotenv
 from openai import OpenAI
 
+if __package__:
+    from . import observability
+else:
+    import observability
+
 load_dotenv()  # picks up any endpoint credentials from a local .env file, if present
 
 try:
@@ -195,6 +200,21 @@ def _guess_category(text: str) -> str:
 def run_episode(ticket, world, chat_fn, max_turns=8,
                  agent_name="helpdesk-triage-agent", model_name="unknown", provider_name="unknown",
                  prior_messages=None, prior_tool_calls=None, follow_up_message=None):
+    """One user submission, including all model/tool steps, in a ticket conversation."""
+    user_message = (follow_up_message if prior_messages is not None else
+                    f"New ticket from account {ticket.account_id}:\n{ticket.text}")
+    with observability.episode_turn(
+        ticket, agent_name, model_name, user_message, SYSTEM_PROMPT,
+    ):
+        return _run_episode(
+            ticket, world, chat_fn, max_turns, agent_name, model_name, provider_name,
+            prior_messages, prior_tool_calls, follow_up_message,
+        )
+
+
+def _run_episode(ticket, world, chat_fn, max_turns=8,
+                 agent_name="helpdesk-triage-agent", model_name="unknown", provider_name="unknown",
+                 prior_messages=None, prior_tool_calls=None, follow_up_message=None):
     """
     prior_messages/prior_tool_calls/follow_up_message: set together to RESUME
     a ticket that previously ended on request_more_info (see PENDING_TOOLS
@@ -227,7 +247,7 @@ def run_episode(ticket, world, chat_fn, max_turns=8,
     tools_schema = _tools_schema_for_category(ticket.category)
 
     for _ in range(max_turns):
-        response = chat_fn(messages, tools_schema)
+        response = observability.chat(chat_fn, messages, tools_schema, model_name, provider_name)
         messages.append({
             "role": "assistant",
             "content": response.get("content"),
@@ -244,24 +264,7 @@ def run_episode(ticket, world, chat_fn, max_turns=8,
         stop = False
         for tc in tool_calls:
             name = tc["function"]["name"]
-            raw_args = tc["function"].get("arguments") or "{}"
-            try:
-                args = json.loads(raw_args)
-            except json.JSONDecodeError:
-                args = {}
-            method = getattr(tools, name, None)
-            if method is None:
-                result = {"error": f"unknown tool {name}"}
-            else:
-                try:
-                    result = method(**args)
-                except Exception as e:
-                    # The model called this tool with missing/malformed
-                    # arguments (e.g. resolve_ticket without kb_article_id).
-                    # Feed the error back as a tool result so the model can
-                    # retry next turn, rather than crashing the whole episode
-                    # (and, with it, the whole eval run) over one bad call.
-                    result = {"error": f"invalid arguments for {name}: {e}"}
+            args, result = observability.execute_tool(tools, tc)
 
             messages.append({
                 "role": "tool", "tool_call_id": tc.get("id", name),
@@ -302,13 +305,17 @@ def run_episode(ticket, world, chat_fn, max_turns=8,
     # prints once when it asks and again once it resolves, matching the two
     # run_episode() calls.
     print(f"[{agent_name}] {final_response_text}")
+    # Record the actually delivered summary separately from raw model output.
+    observability.tracing.get_current_turn().output_messages = [
+        observability.tracing.Message.assistant(final_response_text)
+    ]
 
     return {
         "tool_calls": tools.calls,
         "final_action": final_action,
         "messages": messages,
         "turns": len(messages),
-        "turn_trace_id": None,
+        "turn_trace_id": observability.trace_id(),
         "status": "pending" if pending_question is not None else "done",
         "pending_question": pending_question,
     }
@@ -347,7 +354,12 @@ class HelpdeskAgentModel:
                      "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
                     for tc in msg.tool_calls
                 ]
-            return {"content": msg.content, "tool_calls": tool_calls}
+            return {
+                "content": msg.content, "tool_calls": tool_calls,
+                "response_id": resp.id, "response_model": resp.model,
+                "finish_reasons": [resp.choices[0].finish_reason] if resp.choices[0].finish_reason else [],
+                "usage": resp.usage.model_dump() if resp.usage is not None else None,
+            }
 
         world, ticket = world_and_ticket_from_row({
             "ticket_id": ticket_id, "account_id": account_id, "category": category, "text": text,
@@ -735,9 +747,8 @@ def ask_agent(question, *, ticket_id=None, category=None,
     create_escalation) has been taken, or "pending" if the agent is instead
     waiting on a reply to request_more_info - in which case "pending_question"
     holds that question and "resume" holds everything a follow-up ask_agent()
-    call needs (see the `resume` parameter above). "turn_trace_id" is always
-    None in this de-instrumented module (kept only for shape-compatibility
-    with callers written against agent.py's contract).
+    call needs (see the `resume` parameter above). "turn_trace_id" is the
+    Agent Lens trace ID when tracing is initialized, otherwise None.
 
     Raises ValueError if client="remote" and no api_key/model is available.
     """
@@ -845,7 +856,13 @@ def main():
     parser.add_argument("--model", default=None, help="Model name (required for --client remote)")
     parser.add_argument("--base-url", default=DEFAULT_BASE_URL)
     parser.add_argument("--score", action="store_true", help="Also grade the response against ground truth")
+    parser.add_argument("--trace-project", default=os.environ.get("AGENT_LENS_PROJECT"),
+                        help="Opt in to Agent Lens export to entity/project")
     args = parser.parse_args()
+
+    if args.trace_project:
+        # SDK registers shutdown at process exit; never shut down per request.
+        observability.initialize(args.trace_project)
 
     if args.client == "remote" and not args.model:
         sys.exit("--client remote requires --model")
@@ -892,6 +909,8 @@ def _print_ask_agent_result(result, args):
     print(f"\n(category={result['category']}, tier={args.account_tier}, device_os={args.account_device_os}, "
           f"seats_remaining={args.account_seats_remaining}, history_count_30d={args.history_count_30d})")
     print(f"Turns: {output['turns']}\n")
+    if result.get("turn_trace_id"):
+        print(f"Agent Lens trace: {result['turn_trace_id']}")
     print(result["answer"])
 
     if args.score:
